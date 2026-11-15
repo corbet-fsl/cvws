@@ -1,0 +1,37 @@
+[package]
+name = "cvws"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+description = "Workspace API over the ccvl Yrs document engine: open, apply, receive, take outgoing bytes, view"
+license = "FSL-1.1-ALv2"
+readme = "README.md"
+repository = "https://git.corbet.ch/corbet-fsl/cvws"
+keywords = ["crdt", "yjs", "yrs", "cv"]
+categories = ["data-structures"]
+
+[dependencies]
+ccvl-core = { git = "https://git.corbet.ch/corbet-fsl/ccvl.git", features = ["doc"] }
+serde_json = "1.0"
+
+[dev-dependencies]
+yrs = "0.28"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+# Releases not yet on crates.io that ccvl-core needs, taken from their source
+# repositories at the revisions ccvl pins (a consumer of a git dependency does
+# not inherit ccvl's patch table). Canonical forge URL, exact revision. Remove an
+# entry once its release is published.
+[patch.crates-io]
+cdate = { git = "https://git.corbet.ch/corbet-libre/cdate.git", rev = "2dff4ec4ac5a915ec8bcf2bcb0e3c31ad50248de" }
+cink = { git = "https://git.corbet.ch/corbet-libre/cink.git", rev = "c9497016f27150aface01c0a4b32aa18d15f87ab" }
+cletter = { git = "https://git.corbet.ch/corbet-libre/cletter.git", rev = "940d6f13b385ed48d49f0c53ccb7d3a79bc6e855" }
+cnice = { git = "https://git.corbet.ch/corbet-libre/cnice.git", rev = "decad9624261756fba749235ab418ba4c543740a" }
