@@ -22,11 +22,13 @@
 //! Every call returns the nodes that changed, by location (`NodeRef`: branch and
 //! id path), never a bare id: ids repeat across language trees. A caller reads
 //! only those nodes.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::Range;
 
-pub use ccvl_core::doc::{ActorClass, Changed, NodeRef, OP_CATALOG_VERSION, OpError};
-use ccvl_core::doc::{Doc, inspect_update};
+pub use ccvl_core::doc::{
+    ActorClass, Changed, NodeRef, OP_CATALOG_VERSION, OpError, OutgoingError,
+};
+use ccvl_core::doc::{Doc, UpdateInfo, inspect_update};
 use serde_json::{Map, Value};
 
 /// A profile sub-document of the workspace.
@@ -78,16 +80,28 @@ impl SubDoc {
 }
 
 /// What a call changed, per sub-document in `SUB_DOCS` order; sub-documents that
-/// did not change are absent.
+/// did not change are absent. Counters are for this call (held frames that settled
+/// during it included).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Applied {
     pub changed: Vec<(SubDoc, Changed)>,
-    /// Frames of this call that belong to no sub-document of ours (a `jobs` or
-    /// `settings` update) and were dropped on purpose.
+    /// Frames that belong to no sub-document of ours (a `jobs` or `settings`
+    /// update): dropped on purpose.
     pub foreign: usize,
-    /// Frames held back because no sub-document claims them yet; they are retried
-    /// after every `receive`. Zero when everything found its place.
+    /// Frames that mix sub-documents (more than one profile root, or a profile
+    /// root and a foreign one). A frame cannot be split, so none was applied: the
+    /// host must resync.
+    pub mixed: usize,
+    /// Frames lost: pushed out of the full holding buffer, or refused by their
+    /// sub-document. The host must resync.
+    pub dropped: usize,
+    /// Frames still waiting for a sub-document, after this call.
     pub unrouted: usize,
+    /// Per-sub-document failures of this call; what applied elsewhere is in `changed`.
+    pub failed: Vec<(SubDoc, OpError)>,
+    /// True when this call raised the resync flag (see [`Workspace::take_resync`]).
+    pub resync: bool,
 }
 
 impl Applied {
@@ -123,6 +137,7 @@ impl Applied {
 
 /// An op envelope that was checked against copies of the documents.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct Prepared {
     /// The op to send, with an `opId` (kept if the caller set one).
     pub envelope: Value,
@@ -146,19 +161,70 @@ pub struct TextField<'a> {
 
 /// Update bytes a local edit produced for one sub-document.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Outgoing {
     pub sub_doc: SubDoc,
     pub update: Vec<u8>,
 }
 
+impl Outgoing {
+    /// Bytes for a sub-document (to hand back with [`Workspace::restore_outgoing`]).
+    #[must_use]
+    pub fn new(sub_doc: SubDoc, update: Vec<u8>) -> Self {
+        Self { sub_doc, update }
+    }
+}
+
+/// Lifetime counters of a workspace.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Stats {
+    pub foreign: usize,
+    pub mixed: usize,
+    pub dropped: usize,
+    pub held: usize,
+}
+
 /// The profile sub-documents of one workspace.
 pub struct Workspace {
     docs: BTreeMap<SubDoc, Doc>,
-    unrouted: Vec<Vec<u8>>,
+    held: VecDeque<Held>,
+    foreign_clients: BTreeSet<u64>,
+    resync: bool,
+    stats: Stats,
 }
 
-/// Frames held back for lack of a sub-document; past this the next one is refused.
-const MAX_UNROUTED: usize = 256;
+/// A frame no sub-document claims yet, with what was read from it once.
+struct Held {
+    bytes: Vec<u8>,
+    info: UpdateInfo,
+}
+
+/// Frames larger than this are refused before they are decoded: `yrs` decodes plain
+/// nested values recursively, so the size of a frame bounds the stack a hostile one
+/// can use. Hosts run `receive` on a thread with a stack sized for it (see README).
+pub const MAX_FRAME_BYTES: usize = 1 << 20;
+
+/// Frames held for lack of a sub-document; past this the oldest is dropped, counted,
+/// and the resync flag is raised.
+pub const MAX_HELD: usize = 256;
+
+/// Clients remembered as foreign; past this the memory starts over.
+const MAX_FOREIGN_CLIENTS: usize = 8192;
+
+/// Where a frame goes.
+#[derive(Clone, Copy)]
+enum Route {
+    /// An empty frame.
+    Nothing,
+    /// A frame for roots that are not ours.
+    Foreign,
+    Ours(SubDoc),
+    /// A frame of more than one sub-document.
+    Mixed,
+    /// A frame whose sub-document is not known yet.
+    Unknown,
+}
 
 fn refuse<T>(message: impl Into<String>) -> Result<T, OpError> {
     Err(OpError::from_message(message))
@@ -176,16 +242,14 @@ fn route_op(op: &Value) -> Result<SubDoc, OpError> {
         .and_then(Value::as_str)
         .unwrap_or("undefined");
     let routed = match kind {
-        "cv_profile.replace" => Some(SubDoc::CvProfile),
         "cl_profile.replace" => Some(SubDoc::ClProfile),
         "yjs.update" => op
             .get("sub_doc")
             .and_then(Value::as_str)
             .and_then(SubDoc::parse),
-        "translate" => op
-            .get("source_path")
-            .and_then(Value::as_str)
-            .and_then(route_path),
+        // The web routes every translate to cv-profile (it has no branch_path); the
+        // engine of that sub-document refuses what is not its own.
+        "cv_profile.replace" | "translate" => Some(SubDoc::CvProfile),
         "node.create"
         | "node.update"
         | "node.delete"
@@ -251,16 +315,6 @@ fn plan(op: &Value) -> Result<Vec<(SubDoc, Value)>, OpError> {
     Ok(planned)
 }
 
-/// Where a frame without a sub-document tag goes.
-enum Route {
-    /// An empty frame.
-    Nothing,
-    /// A frame for a root that is not ours.
-    Foreign,
-    Ours(Vec<SubDoc>),
-    Unrouted,
-}
-
 /// Write the ids the engine would generate into the op, batch sub-ops included.
 fn stamp_ids(op: &mut Value, ids: &mut dyn FnMut() -> String) {
     fn missing(value: Option<&Value>) -> bool {
@@ -307,15 +361,18 @@ impl Workspace {
     pub fn open(states: &[(SubDoc, &[u8])]) -> Result<Self, OpError> {
         let mut docs = BTreeMap::new();
         for sub in SUB_DOCS {
-            let doc = match states.iter().find(|(s, _)| *s == sub) {
-                Some((_, bytes)) => Doc::load(bytes)?,
-                None => Doc::new(),
-            };
+            let mut doc = Doc::scoped(sub.root()).expect("a profile root");
+            if let Some((_, bytes)) = states.iter().find(|(s, _)| *s == sub) {
+                doc.receive(bytes)?;
+            }
             docs.insert(sub, doc);
         }
         Ok(Self {
             docs,
-            unrouted: Vec::new(),
+            held: VecDeque::new(),
+            foreign_clients: BTreeSet::new(),
+            resync: false,
+            stats: Stats::default(),
         })
     }
 
@@ -386,140 +443,179 @@ impl Workspace {
 
     /// Take update bytes from the network or a store.
     ///
-    /// With `hint` the update goes to that sub-document. Without it (relay
-    /// frames carry no sub-document tag) the frame is routed by structure, never
-    /// by what it would change on screen, so no update is lost:
+    /// With `hint` the frame goes to that sub-document. Without it (relay frames
+    /// carry no sub-document tag) the frame is attributed by structure, never by what
+    /// it would change on screen, and never by forking a document:
     ///
-    /// 1. a frame that names a root of ours (`cv_profile`, `cl_profile`) goes to
-    ///    that sub-document;
-    /// 2. a frame that names only other roots (`jobs`, `settings`, ...) is not
-    ///    ours and is dropped on purpose (`Applied::foreign`);
-    /// 3. otherwise it goes to the sub-document that already knows one of its
-    ///    clients (on the web every sub-document has its own client id);
-    /// 4. a frame from a client no sub-document has seen goes to the one
-    ///    sub-document it integrates into without waiting for history;
-    /// 5. a frame no sub-document claims yet is held (`Applied::unrouted`) and
-    ///    retried after every `receive`.
+    /// * the roots a frame names (`cv_profile`, `cl_profile`, anything else) and the
+    ///   clients it depends on (parents, origins, deleted items, its authors' earlier
+    ///   history) are read once, by applying the frame to an empty throw-away document;
+    /// * a dependency on a client that a sub-document already holds belongs to that
+    ///   sub-document (on the web every sub-document has its own client id); one on a
+    ///   client seen only in foreign frames is foreign;
+    /// * a frame of one sub-document is applied there; if its history is missing, `yrs`
+    ///   keeps it pending until the history arrives;
+    /// * a frame that is purely foreign (a `jobs` or `settings` edit) is dropped on
+    ///   purpose and counted; its clients are remembered, so the nested frames that
+    ///   follow are recognised as foreign too;
+    /// * a frame that mixes sub-documents cannot be split: it is not applied, counted,
+    ///   and the resync flag is raised, so a document is never polluted;
+    /// * a frame whose sub-document is not known yet is held in a bounded buffer,
+    ///   retried after every `receive`, and pushed out oldest first when the buffer is
+    ///   full (counted, resync flag raised).
     ///
-    /// A frame whose history is still missing stays pending in its sub-document
-    /// until the history arrives.
+    /// A frame larger than [`MAX_FRAME_BYTES`], or one that does not decode, is an error.
+    /// Failures of one sub-document do not hide what another applied: see `Applied::failed`.
     pub fn receive(&mut self, update: &[u8], hint: Option<SubDoc>) -> Result<Applied, OpError> {
+        if update.len() > MAX_FRAME_BYTES {
+            return refuse(format!(
+                "cvws: a frame of {} bytes is larger than the {MAX_FRAME_BYTES} byte limit",
+                update.len()
+            ));
+        }
         let mut applied = Applied::default();
         if let Some(sub) = hint {
-            let changed = self.doc_mut(sub).receive(update)?;
-            applied.merge(sub, changed);
-            return Ok(applied);
+            self.apply_to(sub, update, &mut applied);
+        } else {
+            let info = inspect_update(update)?;
+            let route = self.classify(&info);
+            self.dispatch(route, update.to_vec(), info, &mut applied);
         }
-        let settled = self.place(update, &mut applied)?;
-        if settled {
-            self.retry_unrouted(&mut applied)?;
-        }
-        applied.unrouted = self.unrouted.len();
+        self.retry_held(&mut applied);
+        applied.unrouted = self.held.len();
+        self.stats.held = self.held.len();
         Ok(applied)
     }
 
     /// Frames waiting for a sub-document.
     #[must_use]
     pub fn unrouted(&self) -> usize {
-        self.unrouted.len()
+        self.held.len()
     }
 
-    /// Route one frame and apply it; false when it had to be held back.
-    fn place(&mut self, update: &[u8], applied: &mut Applied) -> Result<bool, OpError> {
-        match self.route(update)? {
-            Route::Nothing => Ok(true),
+    /// Lifetime counters.
+    #[must_use]
+    pub fn stats(&self) -> Stats {
+        self.stats
+    }
+
+    /// True once if frames were lost, mixed or refused since the last call: the host
+    /// should resync the affected sub-documents (and rate-limit doing so). Clears the flag.
+    pub fn take_resync(&mut self) -> bool {
+        std::mem::take(&mut self.resync)
+    }
+
+    fn raise_resync(&mut self, applied: &mut Applied) {
+        self.resync = true;
+        applied.resync = true;
+    }
+
+    fn apply_to(&mut self, sub: SubDoc, update: &[u8], applied: &mut Applied) {
+        match self.doc_mut(sub).receive(update) {
+            Ok(changed) => applied.merge(sub, changed),
+            Err(e) => {
+                applied.failed.push((sub, e));
+                applied.dropped += 1;
+                self.stats.dropped += 1;
+                self.raise_resync(applied);
+            }
+        }
+    }
+
+    fn dispatch(&mut self, route: Route, bytes: Vec<u8>, info: UpdateInfo, applied: &mut Applied) {
+        match route {
+            Route::Nothing => {}
             Route::Foreign => {
                 applied.foreign += 1;
-                Ok(true)
-            }
-            Route::Ours(subs) => {
-                for sub in subs {
-                    let changed = self.doc_mut(sub).receive(update)?;
-                    applied.merge(sub, changed);
+                self.stats.foreign += 1;
+                if self.foreign_clients.len() + info.clients.len() > MAX_FOREIGN_CLIENTS {
+                    self.foreign_clients.clear();
                 }
-                Ok(true)
+                self.foreign_clients.extend(info.clients);
             }
-            Route::Unrouted => {
-                if !self.unrouted.iter().any(|held| held == update) {
-                    if self.unrouted.len() >= MAX_UNROUTED {
-                        return refuse(format!(
-                            "cvws: {MAX_UNROUTED} frames are waiting for a sub-document; refusing more"
-                        ));
-                    }
-                    self.unrouted.push(update.to_vec());
+            Route::Ours(sub) => self.apply_to(sub, &bytes, applied),
+            Route::Mixed => {
+                applied.mixed += 1;
+                self.stats.mixed += 1;
+                self.raise_resync(applied);
+            }
+            Route::Unknown => {
+                if self.held.iter().any(|held| held.bytes == bytes) {
+                    return;
                 }
-                Ok(false)
+                if self.held.len() >= MAX_HELD {
+                    self.held.pop_front();
+                    applied.dropped += 1;
+                    self.stats.dropped += 1;
+                    self.raise_resync(applied);
+                }
+                self.held.push_back(Held { bytes, info });
             }
         }
     }
 
-    fn retry_unrouted(&mut self, applied: &mut Applied) -> Result<(), OpError> {
+    /// Re-attribute held frames until none settles. One frame that fails is dropped and
+    /// counted; the frames behind it are still tried.
+    fn retry_held(&mut self, applied: &mut Applied) {
         loop {
-            let held = std::mem::take(&mut self.unrouted);
-            let before = held.len();
-            for frame in held {
-                self.place(&frame, applied)?;
+            let mut progressed = false;
+            for _ in 0..self.held.len() {
+                let Some(frame) = self.held.pop_front() else {
+                    break;
+                };
+                let route = self.classify(&frame.info);
+                if matches!(route, Route::Unknown) {
+                    self.held.push_back(frame);
+                } else {
+                    progressed = true;
+                    self.dispatch(route, frame.bytes, frame.info, applied);
+                }
             }
-            if self.unrouted.len() >= before {
-                return Ok(());
+            if !progressed {
+                return;
             }
         }
     }
 
-    fn route(&self, update: &[u8]) -> Result<Route, OpError> {
-        let info = inspect_update(update)?;
+    /// Which sub-documents a client is known in.
+    fn owners_of(&self, client: u64) -> Vec<SubDoc> {
+        SUB_DOCS
+            .into_iter()
+            .filter(|sub| self.doc(*sub).knows_client(client))
+            .collect()
+    }
+
+    fn classify(&self, info: &UpdateInfo) -> Route {
         if info.empty {
-            return Ok(Route::Nothing);
+            return Route::Nothing;
         }
-        let named: Vec<SubDoc> = SUB_DOCS
+        let mut ours: BTreeSet<SubDoc> = SUB_DOCS
             .into_iter()
             .filter(|s| info.roots.contains(s.root()))
             .collect();
-        if !named.is_empty() {
-            return Ok(Route::Ours(named));
+        let mut foreign = info.roots.iter().any(|r| SubDoc::from_root(r).is_none());
+        for client in info.clients.iter().chain(&info.depends_on) {
+            ours.extend(self.owners_of(*client));
+            foreign |= self.foreign_clients.contains(client);
         }
-        if !info.roots.is_empty() {
-            return Ok(Route::Foreign);
-        }
-        // Nested structs only: the parents are known somewhere, or not yet.
-        let known: Vec<SubDoc> = SUB_DOCS
-            .into_iter()
-            .filter(|s| info.clients.iter().any(|c| self.doc(*s).knows_client(*c)))
-            .collect();
-        if !known.is_empty() {
-            return Ok(Route::Ours(known));
-        }
-        let mut accepting = Vec::new();
-        for sub in SUB_DOCS {
-            let mut probe = self.doc(sub).fork()?;
-            probe.receive(update)?;
-            if !probe.has_pending() {
-                accepting.push(sub);
-            }
-        }
-        if accepting.len() == 1 {
-            Ok(Route::Ours(accepting))
-        } else {
-            Ok(Route::Unrouted)
+        match (ours.len(), foreign) {
+            (0, true) => Route::Foreign,
+            (0, false) => Route::Unknown,
+            (1, false) => Route::Ours(*ours.iter().next().expect("one element")),
+            _ => Route::Mixed,
         }
     }
 
     /// The update bytes local edits produced since the last call, per sub-document.
     /// If one sub-document cannot hand its bytes over, none are taken.
-    pub fn take_outgoing(&mut self) -> Result<Vec<Outgoing>, OpError> {
+    pub fn take_outgoing(&mut self) -> Result<Vec<Outgoing>, OutgoingError> {
         let mut taken: Vec<Outgoing> = Vec::new();
         for sub in SUB_DOCS {
             match self.doc_mut(sub).take_outgoing() {
                 Ok(update) if update.is_empty() => {}
-                Ok(update) => taken.push(Outgoing {
-                    sub_doc: sub,
-                    update,
-                }),
+                Ok(update) => taken.push(Outgoing::new(sub, update)),
                 Err(e) => {
-                    for given_back in taken {
-                        self.doc_mut(given_back.sub_doc)
-                            .restore_outgoing(given_back.update);
-                    }
+                    self.restore_outgoing(taken);
                     return Err(e);
                 }
             }
@@ -527,9 +623,29 @@ impl Workspace {
         Ok(taken)
     }
 
+    /// Give bytes taken with [`Workspace::take_outgoing`] back, ahead of anything newer,
+    /// when the host could not send or store them.
+    pub fn restore_outgoing(&mut self, bytes: Vec<Outgoing>) {
+        for given_back in bytes {
+            self.doc_mut(given_back.sub_doc)
+                .restore_outgoing(given_back.update);
+        }
+    }
+
     /// One node and its subtree as JSON; `node_path` is the dot-joined id path from the tree root.
     pub fn view(&self, sub: SubDoc, branch_path: &str, node_path: &str) -> Result<Value, OpError> {
         self.doc(sub).view(branch_path, node_path)
+    }
+
+    /// One node by its location, as `Applied` reports it (ids may contain dots).
+    pub fn view_ref(&self, at: &NodeRef) -> Result<Value, OpError> {
+        let sub = route_path(&at.branch).ok_or_else(|| {
+            OpError::from_message(format!(
+                "cvws: '{}' is not a profile branch (cv_profile.<lang>, cl_profile.<lang>)",
+                at.branch
+            ))
+        })?;
+        self.doc(sub).view_ref(at)
     }
 
     /// Replace `range` (UTF-16 units) of a prose field: the keystroke path. A refused
@@ -561,5 +677,65 @@ impl Workspace {
     #[must_use]
     pub fn has_pending(&self, sub: SubDoc) -> bool {
         self.doc(sub).has_pending()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_held_frame_that_fails_is_dropped_and_the_frames_behind_it_still_settle() {
+        let tree = json!({ "id": "root", "kind": "cv-root", "tier": "FIXED",
+            "data": {}, "selection": { "active": ["b"] }, "children": [
+                { "id": "b", "kind": "bullet", "tier": "HYBRID", "data": { "text": "words" },
+                  "selection": { "active": [] }, "children": [] }] });
+        let mut ws = Workspace::open(&[]).expect("open");
+        ws.apply(
+            &json!({ "kind": "cv_profile.replace", "lang": "en", "tree": tree }),
+            ActorClass::Human,
+        )
+        .expect("seed");
+        let seed = inspect_update(&ws.encode_state(SubDoc::CvProfile)).expect("inspect");
+        let mut known = UpdateInfo::default();
+        known.depends_on = seed.clients;
+
+        let mut peer = Workspace::open(&[(SubDoc::CvProfile, &ws.encode_state(SubDoc::CvProfile))])
+            .expect("peer");
+        let field = TextField {
+            sub: SubDoc::CvProfile,
+            branch_path: "cv_profile.en",
+            node_path: "root.b",
+            key: "text",
+        };
+        peer.type_text(&field, 0..0, "good ", ActorClass::Human)
+            .expect("typed");
+        let good = peer.take_outgoing().expect("outgoing").remove(0).update;
+
+        // A frame that cannot be applied sits in front of a good one.
+        ws.held.push_back(Held {
+            bytes: vec![1, 2, 3],
+            info: known.clone(),
+        });
+        ws.held.push_back(Held {
+            bytes: good,
+            info: known,
+        });
+        let mut applied = Applied::default();
+        ws.retry_held(&mut applied);
+        assert_eq!(applied.dropped, 1, "the bad frame is dropped and counted");
+        assert_eq!(applied.failed.len(), 1);
+        assert!(applied.resync);
+        assert!(
+            applied.of(SubDoc::CvProfile).is_some(),
+            "the frame behind it still applied"
+        );
+        assert_eq!(ws.unrouted(), 0);
+        assert_eq!(
+            ws.view(SubDoc::CvProfile, "cv_profile.en", "root.b")
+                .expect("view")["data"]["text"],
+            "good words"
+        );
     }
 }
