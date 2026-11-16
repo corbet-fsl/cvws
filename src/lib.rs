@@ -475,7 +475,16 @@ impl Workspace {
         }
         let mut applied = Applied::default();
         if let Some(sub) = hint {
-            self.apply_to(sub, update, &mut applied);
+            // A hint is a promise about the frame, checked against what the frame says:
+            // a frame that names other roots, or depends on another sub-document's
+            // clients, is attributed there (or refused) instead of left in this one.
+            // With no evidence either way the hint decides.
+            let info = inspect_update(update)?;
+            let route = match self.classify(&info) {
+                Route::Unknown => Route::Ours(sub),
+                other => other,
+            };
+            self.dispatch(route, update.to_vec(), info, &mut applied);
         } else {
             let info = inspect_update(update)?;
             let route = self.classify(&info);

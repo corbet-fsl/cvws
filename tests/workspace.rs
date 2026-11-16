@@ -1077,3 +1077,74 @@ fn a_node_is_viewed_by_the_location_a_change_reported() {
             .is_err()
     );
 }
+
+#[test]
+fn a_sub_doc_never_holds_or_reports_the_other_root() {
+    let roots_of = |ws: &Workspace, sub: SubDoc| -> Vec<String> {
+        ccvl_core::doc::inspect_update(&ws.encode_state(sub))
+            .expect("state")
+            .roots
+            .into_iter()
+            .collect()
+    };
+    let mut ws = seeded();
+    ws.take_outgoing().expect("outgoing");
+    let mut merged = ccvl_core::doc::Doc::new();
+    for (kind, tree) in [
+        ("cv_profile.replace", cv_tree()),
+        ("cl_profile.replace", cl_tree()),
+    ] {
+        merged.apply_op(&replace(kind, &tree)).expect("seed");
+    }
+    let (settings, _) = settings_doc();
+    let frames = [merged.encode_state(), full_state(&settings)];
+    let mut reports: Vec<cvws::Applied> = Vec::new();
+    for frame in &frames {
+        reports.push(ws.receive(frame, None).expect("untagged"));
+        for sub in SUB_DOCS {
+            reports.push(ws.receive(frame, Some(sub)).expect("hinted"));
+        }
+    }
+    // A frame for the cover letter, hinted to the CV sub-document by mistake.
+    let mut cl_peer = peer_of(&ws);
+    typed(
+        &mut cl_peer,
+        SubDoc::ClProfile,
+        CL,
+        "cl-root.body",
+        "text",
+        0..0,
+        "x",
+    );
+    let stray = frame_of(&mut cl_peer);
+    reports.push(
+        ws.receive(&stray, Some(SubDoc::CvProfile))
+            .expect("hinted wrongly"),
+    );
+
+    for sub in SUB_DOCS {
+        assert_eq!(
+            roots_of(&ws, sub),
+            vec![sub.root().to_string()],
+            "{sub:?} holds a foreign root"
+        );
+        assert!(!ws.has_pending(sub), "{sub:?}");
+    }
+    for report in &reports {
+        for (sub, changed) in &report.changed {
+            assert!(
+                changed
+                    .nodes
+                    .iter()
+                    .all(|n| n.branch.starts_with(sub.root())),
+                "{sub:?} reported {changed:?}"
+            );
+        }
+    }
+    assert!(reports.iter().any(|r| r.mixed > 0));
+    assert!(reports.iter().any(|r| r.foreign > 0));
+    // Ops cannot reach the other root either.
+    let cross = json!({ "kind": "batch", "ops": [
+        { "subDoc": "cv-profile", "op": { "kind": "node.update", "branch_path": CL, "node_path": "cl-root.body", "patch": {} } } ] });
+    assert!(ws.apply(&cross, ActorClass::Human).is_err());
+}

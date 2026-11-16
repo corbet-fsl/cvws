@@ -11,7 +11,7 @@ keywords = ["crdt", "yjs", "yrs", "cv"]
 categories = ["data-structures"]
 
 [dependencies]
-ccvl-core = { git = "https://git.corbet.ch/corbet-fsl/ccvl.git", features = ["doc"] }
+ccvl-core = { git = "https://git.corbet.ch/corbet-fsl/ccvl.git", rev = "d143860d3652e7b937c7b714798fbd55a51f237f", features = ["doc"] }
 serde_json = "1.0"
 
 [dev-dependencies]
