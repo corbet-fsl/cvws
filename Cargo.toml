@@ -11,11 +11,14 @@ keywords = ["crdt", "yjs", "yrs", "cv"]
 categories = ["data-structures"]
 
 [dependencies]
+cvfs = { git = "https://git.corbet.ch/corbet-fsl/cvfs.git", rev = "bef17ba278b3e45622fd89251bb084035cc4156e" }
+cvdb = { git = "https://git.corbet.ch/corbet-fsl/cvdb.git", rev = "043f69937ed6d1b082acf4d7b7ca95da42a45521", default-features = false, features = ["sqlite"] }
 ccvl-core = { git = "https://git.corbet.ch/corbet-fsl/ccvl.git", rev = "a492f60ab5dd73ca41b56f197c9d32322d578cef", features = ["doc"] }
 serde_json = "1.0"
 
 [dev-dependencies]
 yrs = "0.28"
+tempfile = "3"
 
 [lints.rust]
 unsafe_code = "forbid"

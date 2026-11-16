@@ -25,6 +25,14 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::Range;
 
+pub mod envelope;
+pub mod store;
+
+/// What a backend reports when it refuses (conflict, integrity, malformed request).
+pub use cvfs::{Commit, Error as StoreError};
+pub use envelope::{Draft, Envelope, Kind, Op, Origin, Receipt, Yjs, content_hash};
+pub use store::{Backend, Store, Update, convert};
+
 pub use ccvl_core::doc::{
     ActorClass, Changed, NodeRef, OP_CATALOG_VERSION, OpError, OutgoingError,
 };
