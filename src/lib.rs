@@ -15,4 +15,4 @@ pub mod store;
 
 pub use cvfs::{Commit, Error as StoreError};
 pub use envelope::{Draft, Envelope, Kind, Op, Origin, Receipt, Yjs, content_hash};
-pub use store::{Backend, Store, Update, convert};
+pub use store::{Backend, RemoteStore, Store, Update, convert};

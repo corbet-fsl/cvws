@@ -5,11 +5,14 @@
 //! retained snapshots. It never merges and never interprets a payload.
 
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
+use cvdb::http::Http;
+use cvdb::remote::{Outcome, Remote};
 use cvdb::store::SqliteStore;
 use cvfs::{Commit, Dump, Error, FsStore, Result};
 
-use crate::envelope::{Draft, Envelope, Kind, Op, Origin, Receipt, Yjs};
+use crate::envelope::{Draft, Envelope, Kind, Op, Origin, Receipt, Yjs, content_hash};
 
 /// One backend of the storage workspace.
 pub trait Store {
@@ -182,6 +185,8 @@ pub enum Backend {
     Fs(FsStore),
     /// Database-backed workspace (`cvdb`, `SQLite`).
     Sqlite(SqliteStore),
+    /// A light server reached over HTTP (`cvdb::remote`): one workspace, sub-documents as keys.
+    Remote(RemoteStore),
 }
 
 impl Backend {
@@ -193,10 +198,21 @@ impl Backend {
         SqliteStore::open(path).map(Self::Sqlite)
     }
 
+    /// A light-server workspace; `dir` holds the durable outbox.
+    pub fn open_remote(
+        http: Arc<dyn Http>,
+        api_base: &str,
+        ws_id: &str,
+        dir: impl AsRef<Path>,
+    ) -> Result<Self> {
+        RemoteStore::open(http, api_base, ws_id, dir.as_ref()).map(Self::Remote)
+    }
+
     fn store(&self) -> &dyn Store {
         match self {
             Self::Fs(s) => s,
             Self::Sqlite(s) => s,
+            Self::Remote(s) => s,
         }
     }
 }
@@ -247,4 +263,205 @@ pub fn convert(src: &dyn Store, dst: &dyn Store, ws: &str) -> Result<Dump> {
         )));
     }
     Ok(dump)
+}
+
+fn unsupported<T>(what: &str) -> Result<T> {
+    Err(Error::Invalid(format!(
+        "{what} is not supported by the remote backend"
+    )))
+}
+
+/// The light-server backend: one workspace, its sub-documents (`jobs`, `settings`, ...) as keys.
+/// It is a byte transport, so it speaks the Yjs subset of [`Store`]: `commit` appends an update
+/// (the record's metadata carries the typed op envelope as `{"op": {...}, "opId": "..."}`, opaque
+/// here), `get_record` reads the head, `ops_since` reads the tail, `receipts` are the ones this
+/// handle received. A commit made while the server is unreachable waits in the durable outbox and
+/// reports `WouldBlock`; [`RemoteStore::flush`] replays it. Listing, retained snapshots, assets,
+/// `dump` and `restore` do not exist on the server and are refused.
+pub struct RemoteStore {
+    remote: Remote,
+    ws: String,
+    receipts: Mutex<Vec<Receipt>>,
+}
+
+impl RemoteStore {
+    pub fn open(http: Arc<dyn Http>, api_base: &str, ws_id: &str, dir: &Path) -> Result<Self> {
+        let remote = Remote::new(http, api_base, ws_id, dir)
+            .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
+        Ok(Self {
+            remote,
+            ws: ws_id.into(),
+            receipts: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Replay the outbox; see [`Remote::flush`].
+    pub fn flush(&self) -> Result<cvdb::remote::Flushed> {
+        self.remote
+            .flush()
+            .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))
+    }
+
+    /// Entries still waiting for the server.
+    pub fn queued(&self) -> usize {
+        self.remote.queued()
+    }
+
+    fn own(&self, ws: &str) -> Result<()> {
+        if ws == self.ws {
+            Ok(())
+        } else {
+            Err(Error::Invalid(format!(
+                "this remote handle serves workspace {}",
+                self.ws
+            )))
+        }
+    }
+
+    fn io(e: &cvdb::Error) -> Error {
+        Error::Io(std::io::Error::other(e.to_string()))
+    }
+}
+
+impl Store for RemoteStore {
+    fn commit(&self, ws: &str, c: &Commit) -> Result<Receipt> {
+        self.own(ws)?;
+        let rec = &c.record;
+        let (Some(y), Some(op)) = (&rec.yjs, &c.op) else {
+            return Err(Error::Invalid(
+                "the remote backend stores Yjs updates only".into(),
+            ));
+        };
+        let meta: serde_json::Value = serde_json::from_str(&rec.metadata)
+            .map_err(|_| Error::Invalid("metadata is not JSON".into()))?;
+        let envelope = meta
+            .get("op")
+            .cloned()
+            .ok_or_else(|| Error::Invalid("metadata needs the op envelope under \"op\"".into()))?;
+        let op_id = meta
+            .get("opId")
+            .and_then(|v| v.as_str())
+            .map_or_else(|| content_hash(&op.bytes), str::to_owned);
+        let updates = std::collections::BTreeMap::from([(rec.key.clone(), op.bytes.clone())]);
+        let expected = std::collections::BTreeMap::from([(rec.key.clone(), y.clock - 1)]);
+        match self.remote.append(&op_id, &envelope, &updates, &expected) {
+            Ok(Outcome::Done(done)) => {
+                let clock = done
+                    .iter()
+                    .find(|d| d.sub_doc == rec.key)
+                    .map_or(y.clock, |d| d.clock);
+                let mut list = self
+                    .receipts
+                    .lock()
+                    .map_err(|_| Error::Integrity("receipts lock poisoned".into()))?;
+                let receipt = Receipt {
+                    seq: list.len() as u64 + 1,
+                    key: rec.key.clone(),
+                    revision: clock,
+                    clock: Some(clock),
+                    content_hash: content_hash(&op.bytes),
+                    at_ms: c.at_ms,
+                };
+                list.push(receipt.clone());
+                Ok(receipt)
+            }
+            Ok(Outcome::Queued) => Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "queued in the outbox",
+            ))),
+            // The server's clock is ahead of the one the commit builds on (how far it is unknown).
+            Err(cvdb::Error::Conflict) => Err(Error::Conflict {
+                key: rec.key.clone(),
+                expected: y.clock - 1,
+                actual: y.clock,
+            }),
+            Err(e) => Err(Self::io(&e)),
+        }
+    }
+
+    fn get_record(&self, ws: &str, key: &str) -> Result<Option<cvfs::Record>> {
+        self.own(ws)?;
+        let f = self
+            .remote
+            .fetch(key, None)
+            .map_err(|e| Self::io(&e))?
+            .ok_or_else(|| Error::Integrity("unexpected 304".into()))?;
+        if f.clock == 0 && f.head.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(cvfs::Record {
+            schema_id: "careervector.yjs-subdoc/v1".into(),
+            key: key.into(),
+            kind: Kind::CrdtSnapshot.as_str().into(),
+            revision: f.clock,
+            content_hash: content_hash(&f.head),
+            bytes: f.head.clone(),
+            metadata: format!("{{\"headClock\":{}}}", f.head_clock()),
+            yjs: Some(Yjs {
+                state_vector: Vec::new(),
+                clock: f.clock,
+            }),
+            origin: None,
+        }))
+    }
+
+    fn keys(&self, _: &str) -> Result<Vec<String>> {
+        unsupported("listing keys")
+    }
+
+    fn ops_since(&self, ws: &str, key: &str, after: u64) -> Result<Vec<Op>> {
+        self.own(ws)?;
+        let f = self
+            .remote
+            .fetch(key, None)
+            .map_err(|e| Self::io(&e))?
+            .ok_or_else(|| Error::Integrity("unexpected 304".into()))?;
+        if after < f.head_clock() {
+            return Err(Error::Invalid(
+                "those updates were folded into the head; reload the head".into(),
+            ));
+        }
+        let base = f.head_clock();
+        Ok(f.tail
+            .into_iter()
+            .enumerate()
+            .map(|(i, bytes)| Op {
+                clock: base + i as u64 + 1,
+                actor_class: "unknown".into(),
+                actor_id: String::new(),
+                at_ms: 0,
+                bytes,
+            })
+            .filter(|o| o.clock > after)
+            .collect())
+    }
+
+    fn receipts(&self, ws: &str, after: u64) -> Result<Vec<Receipt>> {
+        self.own(ws)?;
+        let list = self
+            .receipts
+            .lock()
+            .map_err(|_| Error::Integrity("receipts lock poisoned".into()))?;
+        Ok(list.iter().filter(|r| r.seq > after).cloned().collect())
+    }
+
+    fn retained_records(&self, _: &str, _: &str) -> Result<Vec<cvfs::Record>> {
+        unsupported("retained snapshots")
+    }
+
+    fn put_asset(&self, _: &str, _: &str, _: &[u8]) -> Result<()> {
+        unsupported("assets")
+    }
+
+    fn get_asset(&self, _: &str, _: &str) -> Result<Option<Vec<u8>>> {
+        unsupported("assets")
+    }
+
+    fn dump(&self, _: &str) -> Result<Dump> {
+        unsupported("dump")
+    }
+
+    fn restore(&self, _: &str, _: &Dump) -> Result<()> {
+        unsupported("restore")
+    }
 }

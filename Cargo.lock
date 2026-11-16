@@ -88,7 +88,7 @@ dependencies = [
 [[package]]
 name = "cvdb"
 version = "0.2.0"
-source = "git+https://git.corbet.ch/corbet-fsl/cvdb.git?branch=main#784e00e55ee63f771fdf835acf8581ae7f9d2cca"
+source = "git+https://git.corbet.ch/corbet-fsl/cvdb.git?branch=main#27fa11957eff6a0b82e3353aac2aaad0252f6a4b"
 dependencies = [
  "base64 0.22.1",
  "cvfs",
