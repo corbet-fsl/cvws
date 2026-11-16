@@ -18,7 +18,7 @@ documents say.
 | `Workspace::open(states)` | load sub-documents from stored Yjs state |
 | `Workspace::apply(op, actor)` | route an op or a batch to its sub-documents and apply it |
 | `Workspace::receive(update, hint)` | take update bytes from the network or a store |
-| `Workspace::take_outgoing()` | the bytes local edits produced, per sub-document |
+| `Workspace::take_outgoing()` | the bytes local edits produced, per sub-document (a `Result`: bytes are never lost) |
 | `Workspace::view(sub, branch, node_path)` | read one node |
 
 Two more calls serve hosts that talk to a server which applies ops itself:
@@ -26,14 +26,22 @@ Two more calls serve hosts that talk to a server which applies ops itself:
 * `Workspace::prepare(op, actor)` builds and validates an op envelope against
   copies of the documents without applying it. Send the envelope; the server's
   canonical bytes come back through `receive`, so the edit is not applied twice.
-* `Workspace::type_text(...)` is the keystroke path for prose.
+* `Workspace::type_text(field, range, text, actor)` is the keystroke path for prose. A refused call
+  changes nothing and emits nothing; a non-human actor cannot edit a `FIXED` node.
+* `prepare` also writes the ids the engine would generate (`node.create` ids, `cvl.*` variant ids)
+  into the envelope, so the server produces the same ones.
 
-Every mutating call returns the ids that changed. A caller reads only those.
+Every mutating call returns the nodes that changed, by location (`NodeRef`: the branch
+`<profile>.<lang>` and the dot-joined id path), because ids repeat across language trees.
+A caller reads only those.
 
-`receive` without a `hint` offers the update to every sub-document, because relay
-frames carry no sub-document tag. Each sub-document tries the update on a copy and
-keeps it only if its own profile root changes, so an update meant for another
-sub-document leaves no foreign roots and no pending state behind.
+`receive` without a `hint` routes each frame by structure, never by what it would change, so no
+update is lost (relay frames carry no sub-document tag): a frame naming `cv_profile` or `cl_profile`
+goes there; a frame naming only other roots (`jobs`, `settings`, ...) is dropped on purpose and counted
+(`Applied::foreign`); a frame of a client a sub-document already knows goes to that sub-document (on the
+web every sub-document has its own client id); a frame from an unseen client goes to the one sub-document
+it integrates into without waiting for history; anything else is held (`Applied::unrouted`) and retried
+after every `receive`. A frame whose history is still missing waits, pending, in its sub-document.
 
 Op shapes are the op catalogue of CareerVector (`OP_CATALOG_VERSION`, re-exported
 from `ccvl-core`). Ops for other sub-documents (`job.*`, `settings.update`, ...) are
