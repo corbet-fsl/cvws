@@ -1022,17 +1022,55 @@ fn a_hinted_receive_retries_held_frames_too() {
 }
 
 #[test]
-fn oversized_frames_are_refused_before_they_are_decoded() {
+fn frames_that_cannot_be_read_are_refused_counted_and_flagged() {
     let mut ws = seeded();
-    let err = ws
-        .receive(&vec![0_u8; cvws::MAX_FRAME_BYTES + 1], None)
-        .expect_err("too large");
-    assert!(err.message().contains("larger than"), "{err}");
-    assert!(
-        ws.receive(&[0xff, 0xff, 0xff], None).is_err(),
-        "undecodable frames are errors, not held"
+    for (frame, why) in [
+        (vec![0_u8; cvws::MAX_FRAME_BYTES + 1], "larger than"),
+        (vec![0xff, 0xff, 0xff], "undecodable"),
+    ] {
+        let applied = ws
+            .receive(&frame, None)
+            .expect("refusals are reported, not raised");
+        assert_eq!((applied.dropped, applied.unrouted), (1, 0), "{why}");
+        assert!(
+            applied.refused[0].message().contains(why),
+            "{why}: {:?}",
+            applied.refused
+        );
+        assert!(applied.resync, "{why}");
+    }
+    assert_eq!(ws.stats().dropped, 2);
+    assert!(ws.take_resync());
+    // Settling goes on after a refusal: a held frame still finds its place.
+    let mut x = peer_of(&ws);
+    x.apply(
+        &json!({ "kind": "node.create", "branch_path": CV, "parent_path": "root.item",
+                 "node": node("b8", "bullet", json!({ "text": "fresh" }), vec![]) }),
+        ActorClass::Human,
+    )
+    .expect("x creates");
+    let created = frame_of(&mut x);
+    let mut y = peer_of(&ws);
+    y.receive(&created, Some(SubDoc::CvProfile))
+        .expect("y sees it");
+    typed(
+        &mut y,
+        SubDoc::CvProfile,
+        CV,
+        "root.item.b8",
+        "text",
+        0..0,
+        "very ",
     );
-    assert_eq!(ws.unrouted(), 0);
+    let typing = frame_of(&mut y);
+    assert_eq!(ws.receive(&typing, None).expect("held").unrouted, 1);
+    ws.receive(&[0xff], None).expect("garbage in between");
+    let applied = ws.receive(&created, None).expect("created");
+    assert_eq!(applied.unrouted, 0);
+    assert_eq!(
+        text_of(&ws, SubDoc::CvProfile, CV, "root.item.b8"),
+        "very fresh"
+    );
 }
 
 #[test]
@@ -1147,4 +1185,282 @@ fn a_sub_doc_never_holds_or_reports_the_other_root() {
     let cross = json!({ "kind": "batch", "ops": [
         { "subDoc": "cv-profile", "op": { "kind": "node.update", "branch_path": CL, "node_path": "cl-root.body", "patch": {} } } ] });
     assert!(ws.apply(&cross, ActorClass::Human).is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Round 3: every dependency must agree; shadows; aging; cost
+// ---------------------------------------------------------------------------
+
+fn merged(frames: &[Vec<u8>]) -> Vec<u8> {
+    yrs::merge_updates_v1(frames).expect("merge")
+}
+
+#[test]
+fn a_merged_frame_with_a_foreign_commit_is_never_applied_to_a_profile_doc() {
+    let mut ws = seeded();
+    ws.take_outgoing().expect("outgoing");
+    let untouched = ws.encode_state(SubDoc::CvProfile);
+    // A cv commit nested under a client cv holds, and a settings commit nested under one nobody holds.
+    let mut peer = peer_of(&ws);
+    typed(
+        &mut peer,
+        SubDoc::CvProfile,
+        CV,
+        "root.item.b1",
+        "text",
+        0..0,
+        "x",
+    );
+    let cv_commit = frame_of(&mut peer);
+    let (author, _) = settings_doc();
+    let author_state = full_state(&author);
+    let (typist, text) = doc_from(&author_state);
+    let settings_commit = keystroke(&typist, &text, 0, "s");
+    let both = merged(&[cv_commit, settings_commit]);
+
+    let applied = ws.receive(&both, None).expect("merged");
+    assert!(
+        applied.is_empty(),
+        "an unattributable part holds the whole frame"
+    );
+    assert_eq!(
+        (applied.unrouted, applied.mixed, applied.dropped),
+        (1, 0, 0)
+    );
+    assert_eq!(
+        ws.encode_state(SubDoc::CvProfile),
+        untouched,
+        "nothing was left pending in cv"
+    );
+    assert!(!ws.has_pending(SubDoc::CvProfile));
+
+    // Once the settings author is known, the frame turns out to mix two places: counted, flagged, never applied.
+    let applied = ws.receive(&author_state, None).expect("settings state");
+    assert_eq!((applied.mixed, applied.unrouted), (1, 0));
+    assert!(applied.resync);
+    assert_eq!(ws.encode_state(SubDoc::CvProfile), untouched);
+    quiet(&ws);
+}
+
+#[test]
+fn a_foreign_frame_with_an_unknown_dependency_is_held_and_teaches_nothing() {
+    let mut ws = seeded();
+    let (author, _) = settings_doc();
+    let (typist, text) = doc_from(&full_state(&author));
+    let applied = ws
+        .receive(&keystroke(&typist, &text, 0, "x"), None)
+        .expect("held");
+    assert_eq!((applied.foreign, applied.unrouted), (0, 1));
+    assert_eq!(
+        ws.stats().foreign_clients,
+        0,
+        "its authors were not remembered as foreign"
+    );
+}
+
+#[test]
+fn a_delete_only_frame_goes_to_the_sub_doc_that_holds_the_deleted_items() {
+    let mut ws = seeded();
+    ws.take_outgoing().expect("outgoing");
+    let mut peer = peer_of(&ws);
+    peer.apply(
+        &json!({ "kind": "node.delete", "branch_path": CV, "node_path": "root.item.b1" }),
+        ActorClass::Human,
+    )
+    .expect("delete");
+    let frame = frame_of(&mut peer);
+    let applied = ws.receive(&frame, None).expect("delete frame");
+    assert_eq!(
+        applied.of(SubDoc::CvProfile).expect("cv").nodes,
+        vec![at(CV, "root.item")]
+    );
+    assert!(ws.view(SubDoc::CvProfile, CV, "root.item.b1").is_err());
+    quiet(&ws);
+}
+
+#[test]
+fn a_foreign_map_overwrite_names_no_root_but_is_recognised_by_its_author() {
+    use yrs::Map as _;
+    let mut ws = seeded();
+    let doc = PlainDoc::new();
+    let settings = doc.get_or_insert_map("settings");
+    let before = doc.transact().state_vector();
+    settings.insert(&mut doc.transact_mut(), "theme", "dark");
+    let first = bytes_since(&doc, &before);
+    let before = doc.transact().state_vector();
+    settings.insert(&mut doc.transact_mut(), "theme", "light");
+    let overwrite = bytes_since(&doc, &before);
+    assert_eq!(ws.receive(&first, None).expect("named root").foreign, 1);
+    let applied = ws.receive(&overwrite, None).expect("overwrite");
+    assert_eq!(
+        (applied.foreign, applied.unrouted),
+        (1, 0),
+        "no root on the wire, the author gives it away"
+    );
+    quiet(&ws);
+}
+
+#[test]
+fn what_is_remembered_as_foreign_ages_out_in_two_generations() {
+    use yrs::Map as _;
+    let mut ws = seeded();
+    let fresh_settings_frame = || {
+        let doc = PlainDoc::new();
+        let settings = doc.get_or_insert_map("settings");
+        settings.insert(&mut doc.transact_mut(), "k", "v");
+        doc
+    };
+    let (first, _) = settings_doc();
+    ws.receive(&full_state(&first), None).expect("first");
+    for _ in 0..9_000 {
+        let doc = fresh_settings_frame();
+        assert_eq!(
+            ws.receive(&full_state(&doc), None).expect("frame").foreign,
+            1
+        );
+    }
+    assert!(
+        ws.stats().foreign_clients <= 8_192,
+        "{}",
+        ws.stats().foreign_clients
+    );
+    assert!(
+        ws.stats().foreign_clients > 4_096,
+        "the memory is not cleared all at once"
+    );
+    // The first author is long forgotten: a frame that depends on it waits.
+    let (t0, x0) = doc_from(&full_state(&first));
+    let waiting = ws.receive(&keystroke(&t0, &x0, 0, "x"), None).expect("old");
+    assert_eq!((waiting.foreign, waiting.unrouted), (0, 1));
+    // A recent one is still remembered.
+    let (late_author, _) = settings_doc();
+    let held = ws.receive(&full_state(&late_author), None).expect("recent");
+    assert_eq!(held.foreign, 1);
+    let (typist, text) = doc_from(&full_state(&late_author));
+    assert_eq!(
+        ws.receive(&keystroke(&typist, &text, 0, "x"), None)
+            .expect("recent")
+            .foreign,
+        1
+    );
+}
+
+#[test]
+fn retrying_held_frames_costs_nothing_while_nothing_changed() {
+    let mut ws = seeded();
+    ws.take_outgoing().expect("outgoing");
+    let (author, _) = settings_doc();
+    let state = full_state(&author);
+    for _ in 0..256 {
+        let (tab, text) = doc_from(&state);
+        ws.receive(&keystroke(&tab, &text, 0, "x"), None)
+            .expect("held");
+    }
+    assert_eq!(ws.unrouted(), 256);
+    let before = ws.stats().reclassified;
+    let mut peer = peer_of(&ws);
+    for i in 0..100 {
+        typed(
+            &mut peer,
+            SubDoc::CvProfile,
+            CV,
+            "root.item.b1",
+            "text",
+            0..0,
+            "k",
+        );
+        ws.receive(&frame_of(&mut peer), None)
+            .expect("profile frame");
+        assert_eq!(ws.unrouted(), 256, "frame {i}");
+    }
+    let spent = ws.stats().reclassified - before;
+    assert!(
+        spent <= 2 * 256,
+        "100 frames from one client re-attributed held frames {spent} times"
+    );
+}
+
+#[test]
+fn with_a_shadow_loaded_foreign_keystrokes_never_touch_the_buffer() {
+    let mut ws = seeded();
+    ws.take_outgoing().expect("outgoing");
+    let (author, _) = settings_doc();
+    let state = full_state(&author);
+    ws.load_shadow(cvws::ForeignSub::Settings, &state)
+        .expect("shadow");
+    // A chain of tabs: each has seen the previous tab's keystrokes and types after them.
+    let mut tab_state = state.clone();
+    for i in 0..40 {
+        let (tab, text) = doc_from(&tab_state);
+        let frame = keystroke(&tab, &text, 0, "x");
+        let applied = ws.receive(&frame, None).expect("frame");
+        assert_eq!(
+            (applied.foreign, applied.unrouted, applied.dropped),
+            (1, 0, 0),
+            "tab {i}"
+        );
+        tab_state = full_state(&tab);
+    }
+    assert_eq!(ws.unrouted(), 0);
+    assert!(!ws.take_resync());
+    // Without the shadow the same chain cannot be attributed and waits.
+    let mut bare = seeded();
+    let mut tab_state = state;
+    for _ in 0..5 {
+        let (tab, text) = doc_from(&tab_state);
+        bare.receive(&keystroke(&tab, &text, 0, "x"), None)
+            .expect("frame");
+        tab_state = full_state(&tab);
+    }
+    assert!(bare.unrouted() > 0);
+    quiet(&ws);
+}
+
+#[test]
+fn a_mixed_frame_teaches_the_authors_that_created_foreign_types() {
+    let mut ws = seeded();
+    ws.take_outgoing().expect("outgoing");
+    let profile = PlainDoc::new();
+    {
+        use yrs::Map as _;
+        let cv = profile.get_or_insert_map("cv_profile");
+        let mut txn = profile.transact_mut();
+        cv.insert(&mut txn, "en", MapPrelim::default());
+    }
+    let (author, _) = settings_doc();
+    let author_state = full_state(&author);
+    let mixed = merged(&[full_state(&profile), author_state.clone()]);
+    let applied = ws.receive(&mixed, None).expect("mixed");
+    assert_eq!(applied.mixed, 1);
+    // The settings author is now known to be foreign, so its nested keystrokes are attributed.
+    let (typist, text) = doc_from(&author_state);
+    let applied = ws
+        .receive(&keystroke(&typist, &text, 0, "x"), None)
+        .expect("keystroke");
+    assert_eq!((applied.foreign, applied.unrouted), (1, 0));
+}
+
+#[test]
+fn held_frames_are_capped_in_bytes_as_well_as_in_count() {
+    use yrs::Text as _;
+    let mut ws = seeded();
+    let (author, _) = settings_doc();
+    let state = full_state(&author);
+    let big = "x".repeat(900_000);
+    let mut dropped = 0;
+    for _ in 0..12 {
+        let (tab, text) = doc_from(&state);
+        let before = tab.transact().state_vector();
+        text.insert(&mut tab.transact_mut(), 0, &big);
+        let frame = bytes_since(&tab, &before);
+        assert!(frame.len() < cvws::MAX_FRAME_BYTES);
+        dropped += ws.receive(&frame, None).expect("held").dropped;
+    }
+    assert!(
+        ws.unrouted() <= 9,
+        "{} frames of about 0.9 MB are held",
+        ws.unrouted()
+    );
+    assert!(dropped >= 3, "the oldest were dropped and counted");
+    assert!(ws.take_resync());
 }
