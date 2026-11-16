@@ -78,7 +78,7 @@ checksum = "87a0cf66fd1eb2fb7b822cb78370d82303750809bc6ba855f3f58e517d3238db"
 [[package]]
 name = "ccvl-core"
 version = "0.1.0"
-source = "git+https://git.corbet.ch/corbet-fsl/ccvl.git?rev=d143860d3652e7b937c7b714798fbd55a51f237f#d143860d3652e7b937c7b714798fbd55a51f237f"
+source = "git+https://git.corbet.ch/corbet-fsl/ccvl.git?rev=a492f60ab5dd73ca41b56f197c9d32322d578cef#a492f60ab5dd73ca41b56f197c9d32322d578cef"
 dependencies = [
  "anyhow",
  "base64",
