@@ -67,12 +67,12 @@ fn fill(s: &Backend) {
 
 fn local() -> (tempfile::TempDir, Backend, Backend, Backend, Backend) {
     let dir = tempfile::tempdir().unwrap();
-    let p = dir.path();
-    let a = Backend::open_fs(p.join("fs-a")).unwrap();
-    let b = Backend::open_fs(p.join("fs-b")).unwrap();
-    let c = Backend::open_sqlite(p.join("a.db")).unwrap();
-    let d = Backend::open_sqlite(p.join("b.db")).unwrap();
-    (dir, a, b, c, d)
+    let root = dir.path();
+    let fs_a = Backend::open_fs(root.join("fs-a")).unwrap();
+    let fs_b = Backend::open_fs(root.join("fs-b")).unwrap();
+    let db_a = Backend::open_sqlite(root.join("a.db")).unwrap();
+    let db_b = Backend::open_sqlite(root.join("b.db")).unwrap();
+    (dir, fs_a, fs_b, db_a, db_b)
 }
 
 #[test]
@@ -147,30 +147,30 @@ fn a_remote_bundle_moves_into_a_database_and_back() {
 
 #[test]
 fn unknown_top_level_fields_survive_and_unknown_entry_fields_are_refused() {
-    let (_d, a, b, _, _) = local();
-    fill(&a);
+    let (_d, src, dst, _, _) = local();
+    fill(&src);
     let mut extra = serde_json::Map::new();
     extra.insert("future".into(), json!({"x": [1, 2]}));
-    let one = export_bundle_with(&a, WS, &extra).unwrap();
-    let got = import_bundle(&b, WS, &one).unwrap();
+    let one = export_bundle_with(&src, WS, &extra).unwrap();
+    let got = import_bundle(&dst, WS, &one).unwrap();
     assert_eq!(got.extra, extra);
-    assert_eq!(export_bundle_with(&b, WS, &got.extra).unwrap(), one);
+    assert_eq!(export_bundle_with(&dst, WS, &got.extra).unwrap(), one);
 
-    let mut v: Value = serde_json::from_slice(&one).unwrap();
-    v["receipts"][0]["new_field"] = json!(1);
-    let (_d2, c, _, _, _) = local();
-    let r = import_bundle(&c, WS, &serde_json::to_vec(&v).unwrap());
+    let mut doc: Value = serde_json::from_slice(&one).unwrap();
+    doc["receipts"][0]["new_field"] = json!(1);
+    let (_d2, fresh, _, _, _) = local();
+    let r = import_bundle(&fresh, WS, &serde_json::to_vec(&doc).unwrap());
     assert!(matches!(r, Err(StoreError::Invalid(_))));
 }
 
 #[test]
 fn a_tampered_bundle_is_refused() {
-    let (_d, a, b, _, _) = local();
-    fill(&a);
-    let one = export_bundle(&a, WS).unwrap();
-    let mut v: Value = serde_json::from_slice(&one).unwrap();
-    v["assets"][0]["bytes"] = json!("00");
-    let r = import_bundle(&b, WS, &serde_json::to_vec(&v).unwrap());
+    let (_d, src, dst, _, _) = local();
+    fill(&src);
+    let one = export_bundle(&src, WS).unwrap();
+    let mut doc: Value = serde_json::from_slice(&one).unwrap();
+    doc["assets"][0]["bytes"] = json!("00");
+    let r = import_bundle(&dst, WS, &serde_json::to_vec(&doc).unwrap());
     assert!(matches!(r, Err(StoreError::Integrity(_))));
-    assert_eq!(b.keys(WS).unwrap(), Vec::<String>::new());
+    assert_eq!(dst.keys(WS).unwrap(), Vec::<String>::new());
 }
