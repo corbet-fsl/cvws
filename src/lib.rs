@@ -6,13 +6,16 @@
 //!
 //! It never interprets a document and never merges: Yjs/Yrs bytes, clocks and op logs are preserved
 //! as they came. Applying ops to a document is the engine's job (`ccvl::session`), which persists
-//! through this crate. [`convert`] moves a whole workspace between backends without loss.
+//! through this crate. [`convert`] moves a whole workspace between backends without loss; [`bundle`] exports and imports a
+//! workspace as one byte-exact file.
 
 #![forbid(unsafe_code)]
 
+pub mod bundle;
 pub mod envelope;
 pub mod store;
 
+pub use bundle::{Imported, Manifest, export_bundle, export_bundle_with, import_bundle};
 pub use cvfs::{Commit, Error as StoreError};
 pub use envelope::{Draft, Envelope, Kind, Op, Origin, Receipt, Yjs, content_hash};
 pub use store::{Backend, RemoteStore, Store, Update, convert};

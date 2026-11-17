@@ -282,6 +282,7 @@ pub struct RemoteStore {
     remote: Remote,
     ws: String,
     receipts: Mutex<Vec<Receipt>>,
+    keys: Mutex<Vec<String>>,
 }
 
 impl RemoteStore {
@@ -292,7 +293,29 @@ impl RemoteStore {
             remote,
             ws: ws_id.into(),
             receipts: Mutex::new(Vec::new()),
+            keys: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Name the sub-documents this handle bundles. The server cannot list them, so `keys`, `dump`
+    /// and `restore` (and with them the workspace bundle) work on exactly these.
+    pub fn track(&self, keys: &[&str]) {
+        if let Ok(mut k) = self.keys.lock() {
+            *k = keys.iter().map(|s| (*s).to_owned()).collect();
+            k.sort();
+            k.dedup();
+        }
+    }
+
+    fn tracked(&self) -> Result<Vec<String>> {
+        let k = self
+            .keys
+            .lock()
+            .map_err(|_| Error::Integrity("keys lock poisoned".into()))?;
+        if k.is_empty() {
+            return unsupported("listing keys (call track first)");
+        }
+        Ok(k.clone())
     }
 
     /// Replay the outbox; see [`Remote::flush`].
@@ -405,8 +428,9 @@ impl Store for RemoteStore {
         }))
     }
 
-    fn keys(&self, _: &str) -> Result<Vec<String>> {
-        unsupported("listing keys")
+    fn keys(&self, ws: &str) -> Result<Vec<String>> {
+        self.own(ws)?;
+        self.tracked()
     }
 
     fn ops_since(&self, ws: &str, key: &str, after: u64) -> Result<Vec<Op>> {
@@ -457,11 +481,90 @@ impl Store for RemoteStore {
         unsupported("assets")
     }
 
-    fn dump(&self, _: &str) -> Result<Dump> {
-        unsupported("dump")
+    /// The tracked sub-documents: the heads, the tails (clocks after the head) and this handle's
+    /// receipts. No retained snapshots and no assets exist on the server.
+    fn dump(&self, ws: &str) -> Result<Dump> {
+        self.own(ws)?;
+        let mut d = Dump::default();
+        for key in self.tracked()? {
+            let Some(rec) = self.get_record(ws, &key)? else {
+                continue;
+            };
+            let head = self
+                .remote
+                .fetch(&key, None)
+                .map_err(|e| Self::io(&e))?
+                .ok_or_else(|| Error::Integrity("unexpected 304".into()))?
+                .head_clock();
+            for op in self.ops_since(ws, &key, head)? {
+                d.ops.push((key.clone(), op));
+            }
+            d.records.push(rec);
+        }
+        d.receipts = self.receipts(ws, 0)?;
+        Ok(d)
     }
 
-    fn restore(&self, _: &str, _: &Dump) -> Result<()> {
-        unsupported("restore")
+    /// Replay the updates of an empty server workspace in clock order. A folded head cannot be
+    /// rebuilt through the transport and is refused. Afterwards this handle's receipts are the
+    /// bundle's.
+    fn restore(&self, ws: &str, d: &Dump) -> Result<()> {
+        self.own(ws)?;
+        if !d.retained.is_empty() || !d.assets.is_empty() {
+            return unsupported("retained snapshots and assets");
+        }
+        let tracked = self.tracked()?;
+        for rec in &d.records {
+            if !tracked.contains(&rec.key) {
+                return Err(Error::Invalid(format!(
+                    "{}: not a tracked sub-document",
+                    rec.key
+                )));
+            }
+            if self.get_record(ws, &rec.key)?.is_some() {
+                return Err(Error::Invalid(format!(
+                    "{}: the server workspace is not empty",
+                    rec.key
+                )));
+            }
+            if !rec.bytes.is_empty() {
+                return Err(Error::Invalid(format!(
+                    "{}: a folded head cannot be restored through the transport",
+                    rec.key
+                )));
+            }
+        }
+        let mut ops: Vec<&(String, Op)> = d.ops.iter().collect();
+        ops.sort_by(|a, b| (&a.0, a.1.clock).cmp(&(&b.0, b.1.clock)));
+        for (key, op) in ops {
+            let metadata = serde_json::json!({
+                "op": {"kind": "bundle-import"},
+                "opId": format!("{key}:{}:{}", op.clock, content_hash(&op.bytes)),
+            });
+            let commit = Commit {
+                record: cvfs::Record {
+                    schema_id: "careervector.yjs-subdoc/v1".into(),
+                    key: key.clone(),
+                    kind: Kind::CrdtUpdate.as_str().into(),
+                    revision: op.clock,
+                    content_hash: content_hash(&op.bytes),
+                    bytes: op.bytes.clone(),
+                    metadata: metadata.to_string(),
+                    yjs: Some(Yjs {
+                        state_vector: Vec::new(),
+                        clock: op.clock,
+                    }),
+                    origin: None,
+                },
+                op: Some(op.clone()),
+                at_ms: op.at_ms,
+            };
+            self.commit(ws, &commit)?;
+        }
+        self.receipts
+            .lock()
+            .map_err(|_| Error::Integrity("receipts lock poisoned".into()))?
+            .clone_from(&d.receipts);
+        Ok(())
     }
 }
