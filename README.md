@@ -1,5 +1,9 @@
 # cvws
 
+<!-- ccid:security:begin (rendered by ccid render; do not edit by hand) -->
+**Security and dependencies:** watched by Renovate (with OSV vulnerability alerts); an update is merged only when its tests pass. See the [security policy](SECURITY.md).
+<!-- ccid:security:end -->
+
 The CareerVector storage workspace. It selects the storage backend (`cvfs` files or `cvdb` SQLite),
 owns the document envelope and the `Store` trait, and guarantees conditional writes (compare-and-swap
 on revision and Yjs clock), revision and hash integrity, receipts and retained snapshots.
