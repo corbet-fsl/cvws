@@ -87,9 +87,9 @@ dependencies = [
 
 [[package]]
 name = "cvdb"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1a428552f063bb6e865465c36d517db3a35c6daa02c1ac6668902b0d4dae44f"
+checksum = "2b96d0a3001f07143fe782cc17194de6c9b86fc1edb5dc5aa80e06217f87f87b"
 dependencies = [
  "base64 0.22.1",
  "cvfs",
